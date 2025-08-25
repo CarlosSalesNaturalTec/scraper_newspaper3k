@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+google-cloud-firestore
+firebase-admin
+newspaper3k
+python-dotenv

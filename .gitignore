@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*build/
+*develop-eggs/
+*dist/
+*downloads/
+*eggs/
+*.egg-info/
+*lib/
+*lib64/
+*parts/
+*sdist/
+*var/
+*wheels/
+*share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtualenv
+venv/
+.venv/
+env/
+.env
+ENV/
+
+# Arquivos de configuração local
+.env.*.local
+.env.local
+config/firebase_credentials.json
+
+# IDEs e editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
