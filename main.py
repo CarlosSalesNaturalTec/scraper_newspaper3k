@@ -7,6 +7,10 @@ from newspaper import Article
 from newspaper.article import ArticleException
 from urllib.parse import urlparse
 import datetime
+from dotenv import load_dotenv
+
+# Carrega as variáveis de ambiente do arquivo .env
+load_dotenv()
 
 # --- Configuração do Firebase ---
 try:
@@ -87,7 +91,12 @@ def calculate_relevance(url_data: dict) -> float:
     return round(normalized_score, 2)
 
 
-# --- Endpoint ---
+# --- Endpoints ---
+
+@app.get("/")
+def read_root():
+    return {"message": "Scraper Newspaper3k está no ar!"}
+
 @app.post("/scrape", status_code=status.HTTP_202_ACCEPTED)
 async def trigger_scraping():
     """
@@ -102,7 +111,7 @@ async def trigger_scraping():
             detail="Conexão com o Firestore não está disponível."
         )
 
-    urls_ref = db.collection('urls')
+    urls_ref = db.collection('monitor_results')
     # Busca documentos que ainda não foram processados ou marcados para reprocessamento
     docs_to_process = urls_ref.where('status', 'in', ['pending', 'reprocess']).stream()
 
@@ -140,7 +149,7 @@ async def trigger_scraping():
                     relevance_score = ((relevance_score * 80) + 20) / 100
 
             update_data = {
-                'status': 'scrapeada',
+                'status': 'scraper_ok',
                 'scraped_content': article.text,
                 'scraped_title': article.title,
                 'authors': article.authors,

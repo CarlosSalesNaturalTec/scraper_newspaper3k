@@ -1,6 +1,7 @@
 fastapi
-uvicorn[standard]
+uvicorn
 google-cloud-firestore
 firebase-admin
 newspaper3k
 python-dotenv
+lxml[html_clean]

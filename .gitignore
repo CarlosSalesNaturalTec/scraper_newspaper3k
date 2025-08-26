@@ -1,3 +1,5 @@
+/config/
+
 # Python
 __pycache__/
 *.pyc

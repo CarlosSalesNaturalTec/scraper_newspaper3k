@@ -8,7 +8,7 @@ Este é um micro-serviço FastAPI projetado para extrair conteúdo de artigos da
 - **Filtra Domínios**: Ignora URLs de redes sociais como YouTube, Instagram e Facebook.
 - **Calcula Relevância**: Antes de processar, atribui uma pontuação de relevância à URL com base em critérios como a presença de termos-chave, a confiabilidade do domínio e a estrutura da URL.
 - **Extrai Conteúdo**: Para URLs relevantes, utiliza o `newspaper3k` para extrair o texto principal, título, autores e data de publicação.
-- **Atualiza Status**: Atualiza o documento no Firestore com o conteúdo extraído e o novo status (`scrapeada`, `relevance_failed`, `scraper_failed`, etc.).
+- **Atualiza Status**: Atualiza o documento no Firestore com o conteúdo extraído e o novo status (`scraper_ok`, `relevance_failed`, `scraper_failed`, etc.).
 
 ## Configuração do Ambiente Local
 
