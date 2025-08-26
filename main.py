@@ -2,7 +2,7 @@
 import os
 import firebase_admin
 from firebase_admin import credentials, firestore
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from newspaper import Article
 from newspaper.article import ArticleException
 from urllib.parse import urlparse
@@ -90,90 +90,118 @@ def calculate_relevance(url_data: dict) -> float:
     
     return round(normalized_score, 2)
 
+# --- Funções de Background ---
+def scrape_and_update(run_id: str):
+    """
+    Busca URLs, faz o scraping e atualiza o Firestore.
+    Esta função é projetada para ser executada em background.
+    O status final da execução é registrado no log correspondente ao run_id.
+    """
+    if not db:
+        print(f"Firestore não está disponível para a tarefa {run_id}. A tarefa de scraping em background não pode ser executada.")
+        return
+
+    log_ref = db.collection('system_logs').document(run_id)
+    processed_count = 0
+    try:
+        urls_ref = db.collection('monitor_results')
+        docs_to_process = urls_ref.where('status', 'in', ['pending', 'reprocess']).stream()
+
+        for doc in docs_to_process:
+            url_data = doc.to_dict()
+            doc_id = doc.id
+            link = url_data.get('link')
+
+            if not link:
+                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': 'URL não encontrada no documento.'})
+                continue
+
+            domain = urlparse(link).netloc
+            if domain in SOCIAL_MEDIA_DOMAINS:
+                urls_ref.document(doc_id).update({'status': 'scraper_skipped', 'reason': 'Social media domain'})
+                continue
+
+            relevance_score = calculate_relevance(url_data)
+            
+            if relevance_score < 0.50:
+                urls_ref.document(doc_id).update({'status': 'relevance_failed', 'relevance_score': relevance_score})
+                continue
+
+            try:
+                article = Article(link, language='pt')
+                article.download()
+                article.parse()
+
+                if article.publish_date:
+                    if article.publish_date > (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)):
+                        relevance_score = ((relevance_score * 80) + 20) / 100
+
+                update_data = {
+                    'status': 'scraper_ok',
+                    'scraped_content': article.text,
+                    'scraped_title': article.title,
+                    'authors': article.authors,
+                    'publish_date': article.publish_date,
+                    'relevance_score': relevance_score,
+                    'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                }
+                urls_ref.document(doc_id).update(update_data)
+                processed_count += 1
+
+            except ArticleException as e:
+                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': f"Newspaper3k error: {str(e)}",'last_processed_at': datetime.datetime.now(datetime.timezone.utc)})
+            except Exception as e:
+                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': f"Erro inesperado: {str(e)}",'last_processed_at': datetime.datetime.now(datetime.timezone.utc)})
+        
+        log_ref.update({'status': 'completed', 'end_time': datetime.datetime.now(datetime.timezone.utc), 'processed_count': processed_count})
+        print(f"Processo de scraping em background (run_id: {run_id}) concluído. {processed_count} URLs processadas.")
+
+    except Exception as e:
+        error_msg = f"Erro geral na tarefa de scraping: {str(e)}"
+        print(error_msg)
+        try:
+            log_ref.update({'status': 'failed', 'end_time': datetime.datetime.now(datetime.timezone.utc), 'error_message': error_msg, 'processed_count': processed_count})
+        except Exception as log_e:
+            print(f"Falha ao registrar o erro no log de scraping (run_id: {run_id}): {log_e}")
+
 
 # --- Endpoints ---
-
 @app.get("/")
 def read_root():
     return {"message": "Scraper Newspaper3k está no ar!"}
 
 @app.post("/scrape", status_code=status.HTTP_202_ACCEPTED)
-async def trigger_scraping():
+async def trigger_scraping(background_tasks: BackgroundTasks):
     """
-    Inicia o processo de scraping.
+    Inicia o processo de scraping em background e registra um log da execução.
 
     Este endpoint busca por URLs no Firestore com status 'pending' ou 'reprocess',
     avalia sua relevância, realiza o scraping e atualiza o status no banco.
+    A resposta é imediata e o processo continua em background.
+    Um log da execução é criado na coleção `system_logs`.
     """
     if not db:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Conexão com o Firestore não está disponível."
         )
+    
+    # --- Log da Execução ---
+    log_data = {
+        'task': 'scraper',
+        'start_time': datetime.datetime.now(datetime.timezone.utc),
+        'status': 'started'
+    }
+    try:
+        # Adiciona o log e obtém a referência do documento
+        update_time, log_ref = db.collection('system_logs').add(log_data)
+        run_id = log_ref.id
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Falha ao criar o log da tarefa no Firestore: {e}")
+    
+    background_tasks.add_task(scrape_and_update, run_id)
 
-    urls_ref = db.collection('monitor_results')
-    # Busca documentos que ainda não foram processados ou marcados para reprocessamento
-    docs_to_process = urls_ref.where('status', 'in', ['pending', 'reprocess']).stream()
-
-    processed_count = 0
-    for doc in docs_to_process:
-        url_data = doc.to_dict()
-        doc_id = doc.id
-        link = url_data.get('link')
-
-        if not link:
-            urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': 'URL não encontrada no documento.'})
-            continue
-
-        domain = urlparse(link).netloc
-        if domain in SOCIAL_MEDIA_DOMAINS:
-            urls_ref.document(doc_id).update({'status': 'scraper_skipped', 'reason': 'Social media domain'})
-            continue
-
-        relevance_score = calculate_relevance(url_data)
-        
-        if relevance_score < 0.60:
-            urls_ref.document(doc_id).update({'status': 'relevance_failed', 'relevance_score': relevance_score})
-            continue
-
-        try:
-            article = Article(link, language='pt')
-            article.download()
-            article.parse()
-
-            # Tenta adicionar pontos de relevância pela data de publicação
-            if article.publish_date:
-                # Se a data for nos últimos 2 anos, adiciona o peso
-                if article.publish_date > (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)):
-                    # Adiciona os 20 pontos e recalcula a normalização
-                    relevance_score = ((relevance_score * 80) + 20) / 100
-
-            update_data = {
-                'status': 'scraper_ok',
-                'scraped_content': article.text,
-                'scraped_title': article.title,
-                'authors': article.authors,
-                'publish_date': article.publish_date,
-                'relevance_score': relevance_score,
-                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
-            }
-            urls_ref.document(doc_id).update(update_data)
-            processed_count += 1
-
-        except ArticleException as e:
-            urls_ref.document(doc_id).update({
-                'status': 'scraper_failed',
-                'error_message': f"Newspaper3k error: {str(e)}",
-                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
-            })
-        except Exception as e:
-            urls_ref.document(doc_id).update({
-                'status': 'scraper_failed',
-                'error_message': f"Erro inesperado: {str(e)}",
-                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
-            })
-
-    return {"message": "Processo de scraping iniciado.", "urls_processed_now": processed_count}
+    return {"message": "Processo de scraping em background iniciado.", "run_id": run_id}
 
 if __name__ == "__main__":
     import uvicorn
