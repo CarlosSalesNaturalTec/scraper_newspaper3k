@@ -188,7 +188,7 @@ async def trigger_scraping(background_tasks: BackgroundTasks):
     
     # --- Log da Execução ---
     log_data = {
-        'task': 'scraper',
+        'task': 'Scraping de Notícias',
         'start_time': datetime.datetime.now(datetime.timezone.utc),
         'status': 'started'
     }
