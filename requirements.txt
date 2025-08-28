@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-google-cloud-firestore
-firebase-admin
+google-cloud-firestore==2.16.0
+firebase-admin==6.5.0
 newspaper3k
 python-dotenv
 lxml[html_clean]
