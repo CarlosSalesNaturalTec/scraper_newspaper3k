@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-google-cloud-firestore==2.16.0
+google-cloud-firestore==2.11.0
 firebase-admin==6.5.0
 newspaper3k
 python-dotenv
