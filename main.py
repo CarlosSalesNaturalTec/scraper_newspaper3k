@@ -2,28 +2,47 @@
 import os
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+from google.api_core import retry
+from google.api_core.exceptions import GoogleAPICallError, RetryError
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from newspaper import Article
 from newspaper.article import ArticleException
 from urllib.parse import urlparse
 import datetime
+import time
+import logging
 from dotenv import load_dotenv
 from models.schemas import SystemLog
+
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
 
 # --- Configuração do Firebase ---
-try:
-    # O caminho para o arquivo de credenciais deve ser configurado via variável de ambiente
-    cred_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', './config/firebase_credentials.json')
-    cred = credentials.Certificate(cred_path)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-except Exception as e:
-    print(f"Erro ao inicializar o Firebase Admin: {e}")
-    db = None
+def initialize_firebase():
+    """Inicializa o Firebase com tratamento de erro robusto."""
+    try:
+        # O caminho para o arquivo de credenciais deve ser configurado via variável de ambiente
+        cred_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', './config/firebase_credentials.json')
+        cred = credentials.Certificate(cred_path)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        
+        # Testa a conexão
+        db = firestore.client()
+        # Teste simples de conectividade
+        db.collection('_health_check').limit(1).get()
+        logger.info("Firebase inicializado com sucesso")
+        return db
+    except Exception as e:
+        logger.error(f"Erro ao inicializar o Firebase Admin: {e}")
+        return None
+
+db = initialize_firebase()
 
 app = FastAPI(
     title="Serviço de Scraping com Newspaper3k",
@@ -40,7 +59,11 @@ TRUSTED_DOMAINS = {
     'www.wsj.com', 'www.bloomberg.com', 'apnews.com'
 }
 
-SOCIAL_MEDIA_DOMAINS = {'www.youtube.com', 'youtube.com', 'www.instagram.com', 'instagram.com', 'www.facebook.com', 'facebook.com'}
+SOCIAL_MEDIA_DOMAINS = {
+    'www.youtube.com', 'youtube.com', 'www.instagram.com', 'instagram.com', 
+    'www.facebook.com', 'facebook.com', 'twitter.com', 'www.twitter.com',
+    'x.com', 'www.x.com'
+}
 
 def calculate_relevance(url_data: dict) -> float:
     """
@@ -65,6 +88,36 @@ def calculate_relevance(url_data: dict) -> float:
     normalized_score = score / current_max_score
     return round(normalized_score, 2)
 
+def safe_firestore_operation(operation, max_retries=3, delay=1):
+    """
+    Executa operações do Firestore com retry automático.
+    """
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except (GoogleAPICallError, RetryError, Exception) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Operação falhou após {max_retries} tentativas: {e}")
+                raise
+            logger.warning(f"Tentativa {attempt + 1} falhou, tentando novamente em {delay}s: {e}")
+            time.sleep(delay * (2 ** attempt))  # Backoff exponencial
+
+def update_document_safely(collection_ref, doc_id, update_data):
+    """Atualiza um documento com tratamento de erro robusto."""
+    def operation():
+        return collection_ref.document(doc_id).update(update_data)
+    
+    return safe_firestore_operation(operation)
+
+def get_documents_to_process(urls_ref, limit=50):
+    """Busca documentos para processar com tratamento de erro."""
+    def operation():
+        return urls_ref.where(
+            filter=FieldFilter('status', 'in', ['pending', 'reprocess'])
+        ).limit(limit).stream()
+    
+    return safe_firestore_operation(operation)
+
 # --- Funções de Background ---
 def scrape_and_update(run_id: str):
     """
@@ -72,85 +125,171 @@ def scrape_and_update(run_id: str):
     Esta função é projetada para ser executada em background.
     """
     if not db:
-        print(f"Firestore não está disponível para a tarefa {run_id}.")
+        logger.error(f"Firestore não está disponível para a tarefa {run_id}.")
         return
 
     log_ref = db.collection('system_logs').document(run_id)
     processed_count = 0
+    failed_count = 0
+    
     try:
         urls_ref = db.collection('monitor_results')
-        docs_to_process = urls_ref.where('status', 'in', ['pending', 'reprocess']).limit(200).stream()
-
-        for doc in docs_to_process:
-            url_data = doc.to_dict()
-            doc_id = doc.id
-            link = url_data.get('link')
-
-            if not link:
-                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': 'URL não encontrada no documento.'})
-                continue
-
-            domain = urlparse(link).netloc
-            if domain in SOCIAL_MEDIA_DOMAINS:
-                urls_ref.document(doc_id).update({'status': 'scraper_skipped', 'reason': 'Social media domain'})
-                continue
-
-            relevance_score = calculate_relevance(url_data)
-            
-            if relevance_score < 0.50:
-                urls_ref.document(doc_id).update({'status': 'relevance_failed', 'relevance_score': relevance_score})
-                continue
-
-            try:
-                article = Article(link, language='pt')
-                article.download()
-                article.parse()
-
-                if article.publish_date and isinstance(article.publish_date, datetime.datetime):
-                    if article.publish_date.replace(tzinfo=datetime.timezone.utc) > (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)):
-                        relevance_score = ((relevance_score * 80) + 20) / 100
-
-                update_data = {
-                    'status': 'scraper_ok',
-                    'scraped_content': article.text,
-                    'scraped_title': article.title,
-                    'authors': article.authors,
-                    'publish_date': article.publish_date,
-                    'relevance_score': relevance_score,
-                    'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
-                }
-                urls_ref.document(doc_id).update(update_data)
-                processed_count += 1
-
-            except ArticleException as e:
-                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': f"Newspaper3k error: {str(e)}",'last_processed_at': datetime.datetime.now(datetime.timezone.utc)})
-            except Exception as e:
-                urls_ref.document(doc_id).update({'status': 'scraper_failed', 'error_message': f"Erro inesperado: {str(e)}",'last_processed_at': datetime.datetime.now(datetime.timezone.utc)})
         
-        log_ref.update({
+        # Atualiza o log inicial
+        safe_firestore_operation(lambda: log_ref.update({
+            'status': 'processing',
+            'message': 'Iniciando processo de scraping...'
+        }))
+        
+        # Processa em lotes menores para evitar problemas de memória e timeout
+        batch_size = 5
+        total_processed = 0
+        
+        while total_processed < 5:  # Limite máximo de processamento
+            try:
+                docs_to_process = get_documents_to_process(urls_ref, batch_size)
+                batch_docs = list(docs_to_process)
+                
+                if not batch_docs:
+                    logger.info("Nenhum documento para processar encontrado")
+                    break
+                
+                logger.info(f"Processando lote de {len(batch_docs)} documentos")
+                
+                for doc in batch_docs:
+                    try:
+                        url_data = doc.to_dict()
+                        doc_id = doc.id
+                        link = url_data.get('link')
+
+                        if not link:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': 'URL não encontrada no documento.',
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            continue
+
+                        domain = urlparse(link).netloc
+                        if domain in SOCIAL_MEDIA_DOMAINS:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_skipped', 
+                                'reason': 'Social media domain',
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            continue
+
+                        relevance_score = calculate_relevance(url_data)
+                        
+                        if relevance_score < 0.50:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'relevance_failed', 
+                                'relevance_score': relevance_score,
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            continue
+
+                        # Scraping do artigo
+                        try:
+                            article = Article(link, language='pt')
+                            article.download()
+                            article.parse()
+
+                            # Boost de relevância para artigos recentes
+                            if article.publish_date and isinstance(article.publish_date, datetime.datetime):
+                                if article.publish_date.replace(tzinfo=datetime.timezone.utc) > (
+                                    datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)
+                                ):
+                                    relevance_score = ((relevance_score * 80) + 20) / 100
+
+                            update_data = {
+                                'status': 'scraper_ok',
+                                'scraped_content': article.text[:50000],  # Limita o tamanho do conteúdo
+                                'scraped_title': article.title,
+                                'authors': article.authors[:10] if article.authors else [],  # Limita autores
+                                'publish_date': article.publish_date,
+                                'relevance_score': relevance_score,
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            }
+                            
+                            update_document_safely(urls_ref, doc_id, update_data)
+                            processed_count += 1
+                            logger.info(f"Documento {doc_id} processado com sucesso")
+
+                        except ArticleException as e:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': f"Newspaper3k error: {str(e)[:500]}",
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            logger.warning(f"Erro no scraping do documento {doc_id}: {e}")
+                            
+                        except Exception as e:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': f"Erro inesperado: {str(e)[:500]}",
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            logger.error(f"Erro inesperado no documento {doc_id}: {e}")
+                            
+                    except Exception as doc_e:
+                        logger.error(f"Erro ao processar documento: {doc_e}")
+                        failed_count += 1
+                        continue
+                
+                total_processed += len(batch_docs)
+                
+                # Pausa entre lotes para evitar sobrecarga
+                if len(batch_docs) == batch_size:
+                    time.sleep(1)
+                else:
+                    break  # Último lote processado
+                    
+            except Exception as batch_e:
+                logger.error(f"Erro ao processar lote: {batch_e}")
+                break
+        
+        # Atualiza o log final
+        safe_firestore_operation(lambda: log_ref.update({
             'status': 'completed', 
             'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 
             'processed_count': processed_count,
-            'message': f"Processo de scraping concluído. {processed_count} URLs processadas."
-        })
+            'failed_count': failed_count,
+            'message': f"Processo de scraping concluído. {processed_count} URLs processadas com sucesso, {failed_count} falharam."
+        }))
+        
+        logger.info(f"Scraping concluído: {processed_count} sucessos, {failed_count} falhas")
 
     except Exception as e:
         error_msg = f"Erro geral na tarefa de scraping: {str(e)}"
-        print(error_msg)
+        logger.error(error_msg)
         try:
-            log_ref.update({
+            safe_firestore_operation(lambda: log_ref.update({
                 'status': 'failed', 
                 'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 
-                'error_message': error_msg, 
-                'processed_count': processed_count
-            })
+                'error_message': error_msg[:1000], 
+                'processed_count': processed_count,
+                'failed_count': failed_count
+            }))
         except Exception as log_e:
-            print(f"Falha ao registrar o erro no log de scraping (run_id: {run_id}): {log_e}")
+            logger.error(f"Falha ao registrar o erro no log de scraping (run_id: {run_id}): {log_e}")
 
 # --- Endpoints ---
 @app.get("/")
 def read_root():
-    return {"message": "Scraper Newspaper3k está no ar!"}
+    return {"message": "Scraper Newspaper3k está no ar!", "status": "healthy" if db else "unhealthy"}
+
+@app.get("/health")
+def health_check():
+    """Endpoint para verificar a saúde do serviço."""
+    return {
+        "status": "healthy" if db else "unhealthy",
+        "firebase_connected": db is not None,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
 
 @app.post("/scrape", status_code=status.HTTP_202_ACCEPTED)
 async def trigger_scraping(background_tasks: BackgroundTasks):
@@ -170,10 +309,16 @@ async def trigger_scraping(background_tasks: BackgroundTasks):
     )
     
     try:
-        _, log_ref = db.collection('system_logs').add(log_entry.model_dump())
+        def create_log():
+            return db.collection('system_logs').add(log_entry.model_dump())
+        
+        _, log_ref = safe_firestore_operation(create_log)
         run_id = log_ref.id
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Falha ao criar o log da tarefa no Firestore: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Falha ao criar o log da tarefa no Firestore: {e}"
+        )
     
     background_tasks.add_task(scrape_and_update, run_id)
 
