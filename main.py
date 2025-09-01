@@ -142,10 +142,10 @@ def scrape_and_update(run_id: str):
         }))
         
         # Processa em lotes menores para evitar problemas de memória e timeout
-        batch_size = 5
+        batch_size = 20
         total_processed = 0
         
-        while total_processed < 5:  # Limite máximo de processamento
+        while total_processed < 200:  # Limite máximo de processamento
             try:
                 docs_to_process = get_documents_to_process(urls_ref, batch_size)
                 batch_docs = list(docs_to_process)
