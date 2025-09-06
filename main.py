@@ -277,6 +277,298 @@ def scrape_and_update(run_id: str):
         except Exception as log_e:
             logger.error(f"Falha ao registrar o erro no log de scraping (run_id: {run_id}): {log_e}")
 
+# --- Funções de Background (Fase 1 - Orientada a Eventos) ---
+def scrape_single_document(doc_id: str, run_id: str):
+    """
+    Busca um único documento pelo ID, faz o scraping e atualiza no Firestore.
+    Esta função é projetada para ser acionada por eventos e loga sua execução.
+    """
+    if not db:
+        logger.error(f"Firestore não está disponível para o documento {doc_id}.")
+        return
+
+    log_ref = db.collection('system_logs').document(run_id)
+    urls_ref = db.collection('monitor_results')
+    doc_ref = urls_ref.document(doc_id)
+
+    try:
+        # Atualiza o log para 'processing'
+        log_ref.update({'status': 'processing', 'message': f'Iniciando scraping para o doc_id: {doc_id}'})
+
+        doc = doc_ref.get()
+        if not doc.exists:
+            logger.error(f"Documento {doc_id} não encontrado.")
+            log_ref.update({
+                'status': 'completed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'message': f"Operação concluída: Documento {doc_id} não foi encontrado no Firestore."
+            })
+            return
+
+        url_data = doc.to_dict()
+        link = url_data.get('link')
+
+        if not link:
+            update_document_safely(urls_ref, doc_id, {
+                'status': 'scraper_failed',
+                'error_message': 'URL não encontrada no documento.',
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            })
+            log_ref.update({
+                'status': 'failed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'error_message': 'URL não encontrada no documento.'
+            })
+            return
+
+        domain = urlparse(link).netloc
+        if domain in SOCIAL_MEDIA_DOMAINS:
+            update_document_safely(urls_ref, doc_id, {
+                'status': 'scraper_skipped',
+                'reason': 'Social media domain',
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            })
+            log_ref.update({
+                'status': 'completed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'message': 'Scraping ignorado: Domínio de rede social.'
+            })
+            return
+
+        relevance_score = calculate_relevance(url_data)
+        if relevance_score < 0.50:
+            update_document_safely(urls_ref, doc_id, {
+                'status': 'relevance_failed',
+                'relevance_score': relevance_score,
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            })
+            log_ref.update({
+                'status': 'completed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'message': f'Scraping ignorado: Relevância ({relevance_score}) abaixo do limiar.'
+            })
+            return
+
+        # Scraping do artigo
+        try:
+            article = Article(link, language='pt')
+            article.download()
+            article.parse()
+
+            if article.publish_date and isinstance(article.publish_date, datetime.datetime):
+                if article.publish_date.replace(tzinfo=datetime.timezone.utc) > (
+                    datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)
+                ):
+                    relevance_score = ((relevance_score * 80) + 20) / 100
+
+            update_data = {
+                'status': 'scraper_ok',
+                'scraped_content': article.text[:50000],
+                'scraped_title': article.title,
+                'authors': article.authors[:10] if article.authors else [],
+                'publish_date': article.publish_date,
+                'relevance_score': relevance_score,
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            }
+            update_document_safely(urls_ref, doc_id, update_data)
+            log_ref.update({
+                'status': 'completed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'message': f'Documento {doc_id} processado com sucesso.'
+            })
+            logger.info(f"Documento {doc_id} processado com sucesso via evento.")
+
+        except ArticleException as e:
+            error_message = f"Newspaper3k error: {str(e)[:500]}"
+            update_document_safely(urls_ref, doc_id, {
+                'status': 'scraper_failed',
+                'error_message': error_message,
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            })
+            log_ref.update({
+                'status': 'failed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'error_message': error_message
+            })
+            logger.warning(f"Erro no scraping do documento {doc_id}: {e}")
+
+    except Exception as e:
+        error_msg = f"Erro geral ao processar documento {doc_id}: {str(e)}"
+        logger.error(error_msg)
+        try:
+            update_document_safely(urls_ref, doc_id, {
+                'status': 'scraper_failed',
+                'error_message': error_msg[:1000],
+                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+            })
+            log_ref.update({
+                'status': 'failed',
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'error_message': error_msg
+            })
+        except Exception as log_e:
+            logger.error(f"Falha ao registrar o erro no documento {doc_id}: {log_e}")
+
+
+# --- Funções de Background (Legado) ---
+def scrape_and_update(run_id: str):
+    """
+    Busca URLs, faz o scraping e atualiza o Firestore.
+    Esta função é projetada para ser executada em background.
+    """
+    if not db:
+        logger.error(f"Firestore não está disponível para a tarefa {run_id}.")
+        return
+
+    log_ref = db.collection('system_logs').document(run_id)
+    processed_count = 0
+    failed_count = 0
+    
+    try:
+        urls_ref = db.collection('monitor_results')
+        
+        # Atualiza o log inicial
+        safe_firestore_operation(lambda: log_ref.update({
+            'status': 'processing',
+            'message': 'Iniciando processo de scraping...'
+        }))
+        
+        # Processa em lotes menores para evitar problemas de memória e timeout
+        batch_size = 20
+        total_processed = 0
+        
+        while total_processed < 200:  # Limite máximo de processamento
+            try:
+                docs_to_process = get_documents_to_process(urls_ref, batch_size)
+                batch_docs = list(docs_to_process)
+                
+                if not batch_docs:
+                    logger.info("Nenhum documento para processar encontrado")
+                    break
+                
+                logger.info(f"Processando lote de {len(batch_docs)} documentos")
+                
+                for doc in batch_docs:
+                    try:
+                        url_data = doc.to_dict()
+                        doc_id = doc.id
+                        link = url_data.get('link')
+
+                        if not link:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': 'URL não encontrada no documento.',
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            continue
+
+                        domain = urlparse(link).netloc
+                        if domain in SOCIAL_MEDIA_DOMAINS:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_skipped', 
+                                'reason': 'Social media domain',
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            continue
+
+                        relevance_score = calculate_relevance(url_data)
+                        
+                        if relevance_score < 0.50:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'relevance_failed', 
+                                'relevance_score': relevance_score,
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            continue
+
+                        # Scraping do artigo
+                        try:
+                            article = Article(link, language='pt')
+                            article.download()
+                            article.parse()
+
+                            # Boost de relevância para artigos recentes
+                            if article.publish_date and isinstance(article.publish_date, datetime.datetime):
+                                if article.publish_date.replace(tzinfo=datetime.timezone.utc) > (
+                                    datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=730)
+                                ):
+                                    relevance_score = ((relevance_score * 80) + 20) / 100
+
+                            update_data = {
+                                'status': 'scraper_ok',
+                                'scraped_content': article.text[:50000],  # Limita o tamanho do conteúdo
+                                'scraped_title': article.title,
+                                'authors': article.authors[:10] if article.authors else [],  # Limita autores
+                                'publish_date': article.publish_date,
+                                'relevance_score': relevance_score,
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            }
+                            
+                            update_document_safely(urls_ref, doc_id, update_data)
+                            processed_count += 1
+                            logger.info(f"Documento {doc_id} processado com sucesso")
+
+                        except ArticleException as e:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': f"Newspaper3k error: {str(e)[:500]}",
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            logger.warning(f"Erro no scraping do documento {doc_id}: {e}")
+                            
+                        except Exception as e:
+                            update_document_safely(urls_ref, doc_id, {
+                                'status': 'scraper_failed', 
+                                'error_message': f"Erro inesperado: {str(e)[:500]}",
+                                'last_processed_at': datetime.datetime.now(datetime.timezone.utc)
+                            })
+                            failed_count += 1
+                            logger.error(f"Erro inesperado no documento {doc_id}: {e}")
+                            
+                    except Exception as doc_e:
+                        logger.error(f"Erro ao processar documento: {doc_e}")
+                        failed_count += 1
+                        continue
+                
+                total_processed += len(batch_docs)
+                
+                # Pausa entre lotes para evitar sobrecarga
+                if len(batch_docs) == batch_size:
+                    time.sleep(1)
+                else:
+                    break  # Último lote processado
+                    
+            except Exception as batch_e:
+                logger.error(f"Erro ao processar lote: {batch_e}")
+                break
+        
+        # Atualiza o log final
+        safe_firestore_operation(lambda: log_ref.update({
+            'status': 'completed', 
+            'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 
+            'processed_count': processed_count,
+            'failed_count': failed_count,
+            'message': f"Processo de scraping concluído. {processed_count} URLs processadas com sucesso, {failed_count} falharam."
+        }))
+        
+        logger.info(f"Scraping concluído: {processed_count} sucessos, {failed_count} falhas")
+
+    except Exception as e:
+        error_msg = f"Erro geral na tarefa de scraping: {str(e)}"
+        logger.error(error_msg)
+        try:
+            safe_firestore_operation(lambda: log_ref.update({
+                'status': 'failed', 
+                'end_time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 
+                'error_message': error_msg[:1000], 
+                'processed_count': processed_count,
+                'failed_count': failed_count
+            }))
+        except Exception as log_e:
+            logger.error(f"Falha ao registrar o erro no log de scraping (run_id: {run_id}): {log_e}")
+
 # --- Endpoints ---
 @app.get("/")
 def read_root():
@@ -291,10 +583,11 @@ def health_check():
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
 
-@app.post("/scrape", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/scrape", status_code=status.HTTP_202_ACCEPTED, summary="Endpoint Legado (Batch)")
 async def trigger_scraping(background_tasks: BackgroundTasks):
     """
-    Inicia o processo de scraping em background e registra um log da execução.
+    Inicia o processo de scraping em background para um lote de documentos.
+    **Este é o endpoint legado, acionado por agendamento.**
     """
     if not db:
         raise HTTPException(
@@ -303,7 +596,7 @@ async def trigger_scraping(background_tasks: BackgroundTasks):
         )
     
     log_entry = SystemLog(
-        task='Scraping de Notícias',
+        task='Scraping de Notícias (Batch)',
         start_time=datetime.datetime.now(datetime.timezone.utc),
         status='started'
     )
@@ -322,7 +615,113 @@ async def trigger_scraping(background_tasks: BackgroundTasks):
     
     background_tasks.add_task(scrape_and_update, run_id)
 
-    return {"message": "Processo de scraping em background iniciado.", "run_id": run_id}
+    return {"message": "Processo de scraping em background (batch) iniciado.", "run_id": run_id}
+
+@app.post("/scrape/by-doc-id/{doc_id}", status_code=status.HTTP_202_ACCEPTED, summary="Endpoint Orientado a Eventos")
+async def trigger_scraping_by_doc_id(doc_id: str, background_tasks: BackgroundTasks):
+    """
+    Inicia o processo de scraping em background para um único `doc_id`.
+    **Este é o novo endpoint para ser usado pela arquitetura orientada a eventos.**
+    """
+    if not db:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conexão com o Firestore não está disponível."
+        )
+    
+    log_entry = SystemLog(
+        task='Scraping de Notícia (Evento)',
+        start_time=datetime.datetime.now(datetime.timezone.utc),
+        status='started',
+        metadata={'doc_id': doc_id}
+    )
+    
+    try:
+        def create_log():
+            return db.collection('system_logs').add(log_entry.model_dump(exclude_none=True))
+        
+        _, log_ref = safe_firestore_operation(create_log)
+        run_id = log_ref.id
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Falha ao criar o log da tarefa no Firestore: {e}"
+        )
+        
+    background_tasks.add_task(scrape_single_document, doc_id, run_id)
+
+    return {"message": f"Processo de scraping para o doc_id {doc_id} iniciado.", "run_id": run_id}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# --- Endpoints ---
+@app.get("/")
+def read_root():
+    return {"message": "Scraper Newspaper3k está no ar!", "status": "healthy" if db else "unhealthy"}
+
+@app.get("/health")
+def health_check():
+    """Endpoint para verificar a saúde do serviço."""
+    return {
+        "status": "healthy" if db else "unhealthy",
+        "firebase_connected": db is not None,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+
+@app.post("/scrape", status_code=status.HTTP_202_ACCEPTED, summary="Endpoint Legado (Batch)")
+async def trigger_scraping(background_tasks: BackgroundTasks):
+    """
+    Inicia o processo de scraping em background para um lote de documentos.
+    **Este é o endpoint legado, acionado por agendamento.**
+    """
+    if not db:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conexão com o Firestore não está disponível."
+        )
+    
+    log_entry = SystemLog(
+        task='Scraping de Notícias (Batch)',
+        start_time=datetime.datetime.now(datetime.timezone.utc),
+        status='started'
+    )
+    
+    try:
+        def create_log():
+            return db.collection('system_logs').add(log_entry.model_dump())
+        
+        _, log_ref = safe_firestore_operation(create_log)
+        run_id = log_ref.id
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Falha ao criar o log da tarefa no Firestore: {e}"
+        )
+    
+    background_tasks.add_task(scrape_and_update, run_id)
+
+    return {"message": "Processo de scraping em background (batch) iniciado.", "run_id": run_id}
+
+@app.post("/scrape/by-doc-id/{doc_id}", status_code=status.HTTP_202_ACCEPTED, summary="Endpoint Orientado a Eventos")
+async def trigger_scraping_by_doc_id(doc_id: str, background_tasks: BackgroundTasks):
+    """
+    Inicia o processo de scraping em background para um único `doc_id`.
+    **Este é o novo endpoint para ser usado pela arquitetura orientada a eventos.**
+    """
+    if not db:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conexão com o Firestore não está disponível."
+        )
+    
+    background_tasks.add_task(scrape_single_document, doc_id)
+
+    return {"message": f"Processo de scraping para o doc_id {doc_id} iniciado.", "doc_id": doc_id}
+
 
 if __name__ == "__main__":
     import uvicorn

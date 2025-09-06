@@ -11,7 +11,32 @@ Este serviço é uma API FastAPI focada em uma única tarefa: extrair conteúdo 
 - **Banco de Dados:** Utiliza o SDK `firebase-admin` para ler e atualizar documentos no **Google Firestore**.
 - **Execução Assíncrona:** O processo de scraping é executado como uma tarefa em background (`BackgroundTasks`) para que a chamada à API retorne imediatamente, permitindo que o processo de coleta (que pode ser demorado) continue de forma independente.
 
-## 2. Instruções de Uso e Implantação
+## 2. Endpoints da API
+
+### 2.1. Endpoint Orientado a Eventos (Novo)
+
+-   **Endpoint:** `POST /scrape/by-doc-id/{doc_id}`
+-   **Status:** **Ativo**
+-   **Propósito:** Este é o endpoint principal para a nova arquitetura orientada a eventos. Ele é projetado para ser invocado por uma Cloud Function sempre que um novo documento de interesse for criado.
+-   **Fluxo:**
+    1.  Recebe um `doc_id` específico.
+    2.  Inicia uma tarefa em background (`BackgroundTasks`) para processar **apenas** o documento correspondente na coleção `monitor_results`.
+    3.  A tarefa executa a mesma lógica de validação, cálculo de relevância e scraping do método legado.
+    4.  Atualiza o documento no Firestore com o resultado (`scraper_ok`, `scraper_failed`, etc.).
+    5.  Responde imediatamente com `HTTP 202 Accepted`.
+
+### 2.2. Endpoint Legado (Batch)
+
+-   **Endpoint:** `POST /scrape`
+-   **Status:** **Legado / Em Descomissionamento**
+-   **Propósito:** Endpoint original, projetado para ser acionado por um agendador (`Cloud Scheduler`).
+-   **Fluxo:**
+    1.  Inicia uma tarefa em background que varre a coleção `monitor_results` em busca de todos os documentos com `status` 'pending' ou 'reprocess'.
+    2.  Processa os documentos encontrados em lote.
+    3.  Cria um registro de execução na coleção `system_logs`.
+    4.  **Este método será desativado na Fase 4 do plano de migração.**
+
+## 3. Instruções de Uso e Implantação
 
 ### 2.1. Configuração do Ambiente Local
 
